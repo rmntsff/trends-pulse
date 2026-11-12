@@ -1,12 +1,37 @@
 import type { AiFailure, Language } from "./types";
 
-export const DEFAULT_MODEL = "gemini-3.8-flash";
-export const DEFAULT_FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash-lite"];
+export const DEFAULT_MODEL = "gemini-3.6-flash";
+/** Усі відомі моделі в порядку переваги; основна (GEMINI_MODEL) завжди пробується першою. */
+export const DEFAULT_FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash", "gemini-3.5-flash-lite"];
 
 const BASE_URL = "https://generativelanguage.googleapis.com/v1beta/";
 const MAX_FIELD_CHARS = 200;
 const RETRYABLE_CODES = new Set([500, 502, 503, 504]);
-const FALLBACK_REASONS = new Set<AiFailure>(["server", "rate_limited", "model_not_found"]);
+/** Причини, з яких варто спробувати іншу модель (тайм-аут теж: модель "зависла"). */
+const FALLBACK_REASONS = new Set<AiFailure>(["server", "rate_limited", "model_not_found", "network"]);
+const UNHEALTHY_MILLIS = 10 * 60_000;
+
+/**
+ * Пам'ять про моделі, які щойно не відповіли: наступні 10 хвилин вони пробуються останніми,
+ * тож користувач не чекає щоразу на перевантажену модель.
+ */
+export class ModelHealth {
+  private readonly unhealthyUntil = new Map<string, number>();
+  constructor(private readonly now: () => number = Date.now) {}
+
+  markFailed(model: string): void {
+    this.unhealthyUntil.set(model, this.now() + UNHEALTHY_MILLIS);
+  }
+  markOk(model: string): void {
+    this.unhealthyUntil.delete(model);
+  }
+  /** Здорові моделі в початковому порядку, за ними ті, що нещодавно збоїли. */
+  order(models: string[]): string[] {
+    const healthy = models.filter((m) => (this.unhealthyUntil.get(m) ?? 0) <= this.now());
+    return [...healthy, ...models.filter((m) => !healthy.includes(m))];
+  }
+}
+const sharedHealth = new ModelHealth();
 
 export interface GeminiConfig {
   apiKey: string;
@@ -17,6 +42,7 @@ export interface GeminiConfig {
   fetcher?: typeof fetch;
   requestTimeoutMillis?: number;
   retryDelayMillis?: number;
+  health?: ModelHealth;
 }
 
 export interface PromptItem {
@@ -172,6 +198,8 @@ async function explainWith(
   items: PromptItem[],
   language: Language,
   config: GeminiConfig,
+  /** Повторювати запит до тієї ж моделі при 5xx (лише коли інших моделей не лишилося). */
+  retrySameModel: boolean,
 ): Promise<Map<string, string>> {
   const fetcher = config.fetcher ?? fetch;
   const redact = (text: string) => text.split(config.apiKey).join("***");
@@ -189,7 +217,7 @@ async function explainWith(
         // Ключ у заголовку, а не в URL: не потрапляє в логи.
         headers: { "Content-Type": "application/json", "x-goog-api-key": config.apiKey },
         body: JSON.stringify(buildRequestBody(items, language, model, withThinkingConfig)),
-        signal: AbortSignal.timeout(config.requestTimeoutMillis ?? 60_000),
+        signal: AbortSignal.timeout(config.requestTimeoutMillis ?? 25_000),
       });
       code = response.status;
       responseText = await response.text();
@@ -206,8 +234,8 @@ async function explainWith(
       withThinkingConfig = false;
       continue;
     }
-    // 5xx часто тимчасові ("model is overloaded"): одна повторна спроба.
-    if (RETRYABLE_CODES.has(code) && attempt < 1) {
+    // 5xx часто тимчасові. Якщо є інша модель — одразу йдемо до неї, інакше одна повторна спроба.
+    if (retrySameModel && RETRYABLE_CODES.has(code) && attempt < 1) {
       attempt++;
       await sleep(config.retryDelayMillis ?? 1_500);
       continue;
@@ -226,7 +254,8 @@ async function explainWith(
 }
 
 /**
- * Один запит пояснює одразу кілька трендів. Пробує основну модель, далі резервні.
+ * Один запит пояснює одразу кілька трендів. Пробує основну модель, далі резервні;
+ * моделі, що нещодавно збоїли, пробуються останніми.
  * @returns тексти за id і модель, яка відповіла. Кидає GeminiError з деталями всіх спроб.
  */
 export async function explain(
@@ -234,15 +263,19 @@ export async function explain(
   language: Language,
   config: GeminiConfig,
 ): Promise<{ texts: Map<string, string>; model: string }> {
-  const chain = [...new Set([config.model, ...config.fallbackModels])];
+  const health = config.health ?? sharedHealth;
+  const chain = health.order([...new Set([config.model, ...config.fallbackModels])]);
   const errors: GeminiError[] = [];
-  for (const model of chain) {
+  for (const [index, model] of chain.entries()) {
     try {
-      return { texts: await explainWith(model, items, language, config), model };
+      const texts = await explainWith(model, items, language, config, index === chain.length - 1);
+      health.markOk(model);
+      return { texts, model };
     } catch (e) {
       if (!(e instanceof GeminiError)) throw e;
       errors.push(e);
       if (!FALLBACK_REASONS.has(e.reason)) break;
+      health.markFailed(model);
     }
   }
   const last = errors[errors.length - 1]!;
