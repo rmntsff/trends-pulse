@@ -1,4 +1,5 @@
 import { authenticate } from "./auth";
+import { handleSetup, handleWebhook, WEBHOOK_PATH } from "./bot";
 import { EdgeCache, MemoryCache } from "./cache";
 import { DEFAULT_FALLBACK_MODELS, isConfigured, sanitizeModel, type GeminiConfig } from "./gemini";
 import { TrendsService } from "./service";
@@ -95,6 +96,8 @@ export async function handleApi(request: Request, env: Env, svc: TrendsService =
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname === WEBHOOK_PATH && request.method === "POST") return handleWebhook(request, env);
+    if (url.pathname === "/setup" && request.method === "GET") return handleSetup(request, env);
     if (url.pathname.startsWith("/api/")) {
       try {
         return await handleApi(request, env);
