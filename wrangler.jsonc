@@ -1,0 +1,19 @@
+{
+  // Trends Pulse — Telegram Mini App: статичні файли з public/ + API у src/worker.ts
+  "name": "trends-pulse",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-11-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  },
+  "vars": {
+    // Модель Gemini; якщо вона перевантажена, сервер сам спробує резервні.
+    "GEMINI_MODEL": "gemini-3.8-flash",
+    // Telegram ID користувачів, яким дозволено доступ, через кому. Приклад: "123456789,987654321"
+    "ALLOWED_USER_IDS": ""
+  }
+  // Секрети (НЕ вписуйте сюди!) задаються командами:
+  //   npx wrangler secret put GEMINI_API_KEY
+  //   npx wrangler secret put BOT_TOKEN
+}

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Trends Pulse</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-row">
+      <div class="brand">
+        <h1>Trends Pulse</h1>
+        <p id="subtitle" class="muted small"></p>
+      </div>
+      <button id="btn-ai" class="icon-btn" type="button" aria-label="Стан Gemini AI">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 3l1.8 5.2L17 10l-5.2 1.8L10 17l-1.8-5.2L3 10l5.2-1.8L10 3zm8 10l.9 2.6 2.6.9-2.6.9L18 20l-.9-2.6-2.6-.9 2.6-.9L18 13z"/></svg>
+      </button>
+      <button id="btn-search" class="icon-btn" type="button" aria-label="Пошук серед трендів" aria-expanded="false">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.5 14h-.8l-.3-.3A6.5 6.5 0 1 0 14 15.5l.3.3v.8l5 5 1.5-1.5-5-5zm-6 0a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9z"/></svg>
+      </button>
+      <button id="btn-refresh" class="icon-btn" type="button" aria-label="Оновити тренди">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.7 6.3A8 8 0 1 0 19.7 14h-2.1a6 6 0 1 1-1.4-6.3L13 11h7V4l-2.3 2.3z"/></svg>
+      </button>
+      <button id="btn-settings" class="icon-btn" type="button" aria-label="Налаштування">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 17v2h6v-2H3zM3 5v2h10V5H3zm10 16v-2h8v-2h-8v-2h-2v6h2zM7 9v2H3v2h4v2h2V9H7zm14 4v-2H11v2h10zm-6-4h2V7h4V5h-4V3h-2v6z"/></svg>
+      </button>
+    </div>
+    <div id="search-row" class="search-row" hidden>
+      <input id="search" type="search" placeholder="Фільтрувати за словом" autocomplete="off" enterkeyhint="search" aria-label="Фільтрувати за словом">
+    </div>
+    <nav id="tabs" class="tabs" role="tablist" aria-label="Країна"></nav>
+  </header>
+
+  <main id="content" aria-live="polite"></main>
+
+  <!-- Дії з трендом -->
+  <dialog id="sheet-actions" class="sheet" aria-labelledby="actions-title">
+    <h2 id="actions-title" class="sheet-title"></h2>
+    <button class="sheet-item" type="button" data-action="search">Пошук у Google</button>
+    <button class="sheet-item" type="button" data-action="share">Поділитися</button>
+    <button class="sheet-item" type="button" data-action="explain" id="action-explain">Пояснити з Gemini</button>
+    <button class="sheet-item sheet-cancel" type="button" data-action="close">Закрити</button>
+  </dialog>
+
+  <!-- Налаштування -->
+  <dialog id="sheet-settings" class="sheet" aria-labelledby="settings-title">
+    <h2 id="settings-title" class="sheet-title">Налаштування</h2>
+    <p class="label">Країна для третьої вкладки</p>
+    <div id="region-chips" class="chips" role="radiogroup" aria-label="Країна для третьої вкладки"></div>
+    <p class="label">Мова AI-пояснень</p>
+    <div id="lang-chips" class="chips" role="radiogroup" aria-label="Мова AI-пояснень"></div>
+    <label class="switch-row">
+      <span>
+        <span class="switch-title">Пояснювати автоматично</span>
+        <span id="auto-hint" class="muted small block">Gemini пише 1–2 речення до кожного тренду</span>
+      </span>
+      <input id="auto-explain" type="checkbox" role="switch">
+    </label>
+    <p class="note muted small">Google Trends RSS публікує лише поточні тренди (приблизно за останню добу) для всієї країни. Періоду, категорій і демографії в цьому джерелі немає.</p>
+    <button id="settings-apply" class="primary-btn" type="button">Застосувати</button>
+  </dialog>
+
+  <!-- Стан Gemini -->
+  <dialog id="sheet-ai" class="sheet" aria-labelledby="ai-title">
+    <h2 id="ai-title" class="sheet-title">Gemini AI</h2>
+    <p id="ai-status" class="status-box"></p>
+    <div id="ai-error-box" class="error-box" hidden>
+      <p class="label">Остання відповідь Gemini</p>
+      <pre id="ai-error"></pre>
+    </div>
+    <p class="muted">Сервер завантажує RSS Google Trends, а Gemini одним запитом пише 1–2 речення до кожного тренду вкладки. Текст від Gemini позначено ✨, текст із новин — 📰. Ключ Gemini зберігається лише на сервері.</p>
+    <button class="primary-btn" type="button" data-close>Зрозуміло</button>
+  </dialog>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
