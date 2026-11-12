@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MemoryCache } from "../src/cache";
-import { buildRequestBody, classifyHttpError, explain, parseResponse, sanitizeModel, type GeminiConfig } from "../src/gemini";
+import { buildRequestBody, classifyHttpError, explain, ModelHealth, parseResponse, sanitizeModel, type GeminiConfig } from "../src/gemini";
 import { TrendsService } from "../src/service";
 import { handleApi } from "../src/worker";
 import type { Env, Region, Trend } from "../src/types";
@@ -28,7 +28,7 @@ function fakeGemini(responses: (() => Response)[]) {
     if (!next) throw new Error("no more responses");
     return next();
   }) as unknown as typeof fetch;
-  const config: GeminiConfig = { apiKey: "test-key", model: "gemini-3.8-flash", fallbackModels: ["gemini-3.6-flash"], fetcher, retryDelayMillis: 0 };
+  const config: GeminiConfig = { apiKey: "test-key", model: "gemini-3.8-flash", fallbackModels: ["gemini-3.6-flash"], fetcher, retryDelayMillis: 0, health: new ModelHealth() };
   return { calls, config };
 }
 const item = { id: "t0", query: "q", traffic: null, headlines: ["h"] };
@@ -45,17 +45,35 @@ describe("gemini client", () => {
     expect(calls[0]!.body.generationConfig).toMatchObject({ thinkingConfig: { thinkingLevel: "low" }, responseMimeType: "application/json" });
   });
 
-  it("retries once, then falls back to the next model", async () => {
-    const { calls, config } = fakeGemini([overloaded, overloaded, () => ok(["t0", "Від резервної"])]);
-    const result = await explain([item], "uk", config);
-    expect(result).toMatchObject({ model: "gemini-3.6-flash" });
-    expect(calls.map((c) => c.url.match(/models\/([^:]+)/)![1])).toEqual(["gemini-3.8-flash", "gemini-3.8-flash", "gemini-3.6-flash"]);
+  it("falls back to the next model immediately and remembers the unhealthy one", async () => {
+    const { calls, config } = fakeGemini([overloaded, () => ok(["t0", "Від резервної"]), () => ok(["t0", "Знову"])]);
+    const models = () => calls.map((c) => c.url.match(/models\/([^:]+)/)![1]);
+    expect(await explain([item], "uk", config)).toMatchObject({ model: "gemini-3.6-flash" });
+    expect(models()).toEqual(["gemini-3.8-flash", "gemini-3.6-flash"]);
+    // Наступний запит одразу йде до моделі, яка працює.
+    expect(await explain([item], "uk", config)).toMatchObject({ model: "gemini-3.6-flash" });
+    expect(models()).toEqual(["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.6-flash"]);
   });
 
-  it("reports every attempt when all models fail, without leaking the key", async () => {
+  it("returns to the preferred model after the unhealthy period", () => {
+    let clock = 0;
+    const health = new ModelHealth(() => clock);
+    health.markFailed("a");
+    expect(health.order(["a", "b"])).toEqual(["b", "a"]);
+    clock += 11 * 60_000;
+    expect(health.order(["a", "b"])).toEqual(["a", "b"]);
+  });
+
+  it("falls back on a timeout too", async () => {
+    const { config } = fakeGemini([() => { throw new DOMException("timed out", "TimeoutError"); }, () => ok(["t0", "ok"])]);
+    expect(await explain([item], "uk", config)).toMatchObject({ model: "gemini-3.6-flash" });
+  });
+
+  it("retries the last model once and reports every attempt, without leaking the key", async () => {
     const leak = () => new Response(JSON.stringify({ error: { status: "UNAVAILABLE", message: "busy test-key" } }), { status: 503 });
-    const { config } = fakeGemini([leak, leak, leak, leak]);
+    const { calls, config } = fakeGemini([leak, leak, leak]);
     const error = await explain([item], "uk", config).catch((e) => e);
+    expect(calls).toHaveLength(3);
     expect(error.reason).toBe("server");
     expect(error.message).toContain("HTTP 503 · gemini-3.8-flash");
     expect(error.message).toContain("HTTP 503 · gemini-3.6-flash");
@@ -88,8 +106,8 @@ describe("gemini client", () => {
     expect([429, 403, 404, 503, 418].map((c) => classifyHttpError(c, ""))).toEqual(["rate_limited", "invalid_key", "model_not_found", "server", "bad_response"]);
     expect(classifyHttpError(400, "API_KEY_INVALID")).toBe("invalid_key");
     expect(sanitizeModel(" models/gemini-3.6-flash ")).toBe("gemini-3.6-flash");
-    expect(sanitizeModel("AQ.Ab8RN6Il1nX6G4e3x06Q-Hdb")).toBe("gemini-3.8-flash");
-    expect(sanitizeModel(undefined)).toBe("gemini-3.8-flash");
+    expect(sanitizeModel("AQ.Ab8RN6Il1nX6G4e3x06Q-Hdb")).toBe("gemini-3.6-flash");
+    expect(sanitizeModel(undefined)).toBe("gemini-3.6-flash");
     expect((buildRequestBody([item], "en", "gemini-2.5-flash").generationConfig as any).thinkingConfig).toEqual({ thinkingBudget: 0 });
   });
 });
