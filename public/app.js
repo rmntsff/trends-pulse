@@ -1,16 +1,18 @@
-// Trends Pulse — клієнт Telegram Mini App. Без фреймворків і без етапу збірки.
-// Увесь текст із мережі вставляється лише через textContent (жодного innerHTML із даними).
+// Trends Pulse — клієнт Telegram Mini App. Дизайн за макетами Google Stitch, дані — лише справжні.
+// Увесь текст із мережі вставляється через textContent (жодного innerHTML із даними).
+import { ICONS, ICON_VIEWBOX } from "./icons.js";
 
 const tg = window.Telegram?.WebApp;
+const inTelegram = Boolean(tg?.initData);
 const $ = (id) => document.getElementById(id);
 
 const REGIONS = {
-  UA: ["🇺🇦", "Україна"], US: ["🇺🇸", "США"], GB: ["🇬🇧", "Велика Британія"], DE: ["🇩🇪", "Німеччина"],
-  PL: ["🇵🇱", "Польща"], FR: ["🇫🇷", "Франція"], CA: ["🇨🇦", "Канада"], JP: ["🇯🇵", "Японія"],
-  IT: ["🇮🇹", "Італія"], ES: ["🇪🇸", "Іспанія"],
+  UA: ["🇺🇦", "Україна", "в Україні"], US: ["🇺🇸", "США", "у США"], GB: ["🇬🇧", "Велика Британія", "у Великій Британії", "Британія"],
+  DE: ["🇩🇪", "Німеччина", "у Німеччині"], PL: ["🇵🇱", "Польща", "у Польщі"], FR: ["🇫🇷", "Франція", "у Франції"],
+  CA: ["🇨🇦", "Канада", "у Канаді"], JP: ["🇯🇵", "Японія", "в Японії"], IT: ["🇮🇹", "Італія", "в Італії"], ES: ["🇪🇸", "Іспанія", "в Іспанії"],
 };
 const EXPLORE_CHOICES = Object.keys(REGIONS).filter((code) => code !== "UA" && code !== "US");
-const LANGUAGES = { uk: "🇺🇦 Українська", en: "🇬🇧 English" };
+const LANGUAGES = { uk: "Українська", en: "English" };
 const LOAD_ERRORS = {
   network: "Немає з'єднання з Google Trends. Спробуйте трохи згодом.",
   http: "Google Trends тимчасово не відповідає. Спробуйте трохи згодом.",
@@ -28,13 +30,14 @@ const LIMITS = { ukraine: 5, usa: 5, explore: 10 };
 
 // ---------- Налаштування (зберігаються на пристрої) ----------
 function loadSettings() {
-  const defaults = { exploreRegion: "GB", language: "uk", autoExplain: true };
+  const defaults = { exploreRegion: "GB", language: "uk", autoExplain: true, mode: "ai" };
   try {
     const saved = JSON.parse(localStorage.getItem("settings") ?? "{}");
     return {
       exploreRegion: EXPLORE_CHOICES.includes(saved.exploreRegion) ? saved.exploreRegion : defaults.exploreRegion,
       language: saved.language in LANGUAGES ? saved.language : defaults.language,
       autoExplain: typeof saved.autoExplain === "boolean" ? saved.autoExplain : defaults.autoExplain,
+      mode: saved.mode === "headlines" ? "headlines" : "ai",
     };
   } catch {
     return defaults;
@@ -48,26 +51,24 @@ function saveSettings() {
 const settings = loadSettings();
 const state = {
   settings,
+  screen: "feed", // feed | detail | settings
   selected: "ukraine",
-  query: "",
-  /** feed -> { region, status: 'loading'|'loaded'|'failed', error, trends, updatedAt, token } */
-  sections: {
-    ukraine: newSection("UA"),
-    usa: newSection("US"),
-    explore: newSection(settings.exploreRegion),
-  },
+  detail: null, // { feed, key }
+  feedScroll: 0,
+  sections: { ukraine: newSection("UA"), usa: newSection("US"), explore: newSection(settings.exploreRegion) },
   /** `${lang}|${trendKey}` -> { status: 'loading' } | { status: 'ai', text, model } | { status: 'failed', reason, detail } */
   explanations: new Map(),
-  ai: { enabled: false, model: "" },
+  ai: { enabled: false, model: "", fallbacks: [] },
+  serverOnline: null,
   lastAiError: null,
-  /** null | { kind: 'not_telegram' | 'not_allowed' | 'misconfigured', userId } — екран замість списку */
-  blocked: null,
+  blocked: null, // { kind: 'not_telegram' | 'not_allowed' | 'misconfigured', userId }
   refreshing: false,
 };
 function newSection(region) {
   return { region, status: "loading", error: null, trends: [], updatedAt: null, token: 0 };
 }
-const explanationKey = (trend) => `${state.settings.language}|${trend.key}`;
+const keyFor = (trend, language = state.settings.language) => `${language}|${trend.key}`;
+const explanationOf = (trend) => state.explanations.get(keyFor(trend));
 
 // ---------- API ----------
 class ApiError extends Error {
@@ -81,8 +82,10 @@ async function api(path, options = {}) {
       headers: { ...(options.body ? { "Content-Type": "application/json" } : {}), Authorization: `tma ${tg?.initData ?? ""}` },
     });
   } catch {
+    state.serverOnline = false;
     throw new ApiError(0, { error: "offline" });
   }
+  state.serverOnline = true;
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new ApiError(response.status, data);
   return data;
@@ -106,7 +109,7 @@ async function loadSection(feed, { refresh = false } = {}) {
     const data = await api(`/api/trends?${params}`);
     if (section.token !== token) return;
     Object.assign(section, { status: "loaded", error: null, trends: data.trends, updatedAt: data.updatedAtMillis });
-    state.ai = data.ai;
+    state.ai = { fallbacks: [], ...data.ai };
     render();
     if (state.settings.autoExplain) await explain(feed);
   } catch (error) {
@@ -125,16 +128,15 @@ async function refreshAll() {
   render();
 }
 
-/** Пояснення для вкладки (або одного тренду, якщо задано `only`; тоді кеш сервера оминається). */
+/** Пояснення для вкладки або одного тренду (`only`: тоді кеш сервера оминається). */
 async function explain(feed, only = null) {
   if (!state.ai.enabled) return;
   const section = state.sections[feed];
   const language = state.settings.language;
-  const key = (trend) => `${language}|${trend.key}`;
-  const targets = only ? [only] : section.trends.filter((trend) => state.explanations.get(key(trend))?.status !== "ai");
+  const targets = only ? [only] : section.trends.filter((trend) => state.explanations.get(keyFor(trend, language))?.status !== "ai");
   if (targets.length === 0) return;
 
-  for (const trend of targets) state.explanations.set(key(trend), { status: "loading" });
+  for (const trend of targets) state.explanations.set(keyFor(trend, language), { status: "loading" });
   render();
   let results = {};
   let failure = null;
@@ -149,7 +151,7 @@ async function explain(feed, only = null) {
   let detail = null;
   for (const trend of targets) {
     const result = results[trend.key] ?? failure ?? { status: "failed", reason: "bad_response", detail: null };
-    state.explanations.set(key(trend), result);
+    state.explanations.set(keyFor(trend, language), result);
     if (result.status === "ai") anySuccess = true;
     else detail ??= result.detail;
   }
@@ -159,6 +161,17 @@ async function explain(feed, only = null) {
 }
 
 // ---------- Допоміжне ----------
+const SVG_NS = "http://www.w3.org/2000/svg";
+function icon(name, size = "") {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", ICON_VIEWBOX);
+  svg.setAttribute("class", `icon ${size}`.trim());
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS(SVG_NS, "path");
+  path.setAttribute("d", ICONS[name]);
+  svg.append(path);
+  return svg;
+}
 function el(tag, props = {}, ...children) {
   const node = document.createElement(tag);
   for (const [name, value] of Object.entries(props)) {
@@ -167,7 +180,7 @@ function el(tag, props = {}, ...children) {
     else if (name.startsWith("on")) node.addEventListener(name.slice(2), value);
     else if (value !== null && value !== undefined && value !== false) node.setAttribute(name, value === true ? "" : value);
   }
-  node.append(...children.filter(Boolean));
+  node.append(...children.flat(Infinity).filter((child) => child !== null && child !== undefined && child !== false && child !== ""));
   return node;
 }
 function relativeTime(millis) {
@@ -177,9 +190,9 @@ function relativeTime(millis) {
   if (minutes < 24 * 60) return `${Math.floor(minutes / 60)} год тому`;
   return `${Math.floor(minutes / (24 * 60))} дн тому`;
 }
-const clock = (millis) => new Date(millis).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-const regionLabel = (code) => `${REGIONS[code][0]} ${REGIONS[code][1]}`;
-const shortModel = (model) => model.replace(/^gemini-/, "");
+const clock = (millis) => new Date(millis).toLocaleTimeString("uk-UA", { hour: "2-digit", minute: "2-digit" });
+const shortModel = (model) => (model ?? "").replace(/^gemini-/, "");
+const traffic = (trend) => (trend.approxTraffic ? `${trend.approxTraffic} запитів` : "сплеск запитів");
 
 function newsContext(trend) {
   const news = trend.news[0];
@@ -192,241 +205,442 @@ function isSafeUrl(url) {
 }
 function openUrl(url) {
   if (!isSafeUrl(url)) return;
-  if (tg?.openLink && tg.initData) tg.openLink(url);
+  if (inTelegram && tg.openLink) tg.openLink(url);
   else window.open(url, "_blank", "noopener,noreferrer");
 }
 function shareTrend(trend) {
-  const explanation = state.explanations.get(explanationKey(trend));
+  const explanation = explanationOf(trend);
   const context = explanation?.status === "ai" ? explanation.text : (newsContext(trend) ?? "");
-  const text = `${trend.title} — тренд Google (${REGIONS[trend.region][1]})\n${context}`.trim();
+  const text = `${trend.title} — тренд Google ${REGIONS[trend.region][2]}\n${context}`.trim();
   const link = `https://t.me/share/url?url=${encodeURIComponent(trend.openUrl)}&text=${encodeURIComponent(text)}`;
-  if (tg?.openTelegramLink && tg.initData) tg.openTelegramLink(link);
+  if (inTelegram && tg.openTelegramLink) tg.openTelegramLink(link);
   else if (navigator.share) navigator.share({ text, url: trend.openUrl }).catch(() => {});
   else window.open(link, "_blank", "noopener,noreferrer");
 }
+async function copyText(text, message) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(message);
+  } catch {
+    toast("Не вдалося скопіювати", "close");
+  }
+}
+let toastTimer = 0;
+function toast(text, iconName = "check") {
+  const node = $("toast");
+  node.replaceChildren(icon(iconName, "sm"), el("span", { text }));
+  node.classList.add("show");
+  tg?.HapticFeedback?.notificationOccurred?.(iconName === "check" ? "success" : "error");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => node.classList.remove("show"), 2200);
+}
+const haptic = () => tg?.HapticFeedback?.selectionChanged?.();
 
-// ---------- Рендер ----------
-function visibleTrends(section) {
-  const query = state.query.trim().toLowerCase();
-  if (!query) return section.trends;
-  return section.trends.filter((trend) => {
-    const explanation = state.explanations.get(explanationKey(trend));
-    return trend.title.toLowerCase().includes(query)
-      || trend.news.some((n) => n.title.toLowerCase().includes(query))
-      || (explanation?.status === "ai" && explanation.text.toLowerCase().includes(query));
-  });
+// ---------- Навігація ----------
+function go(screen, detail = null) {
+  if (state.screen === "feed") state.feedScroll = window.scrollY;
+  state.screen = screen;
+  state.detail = detail;
+  haptic();
+  render();
+  window.scrollTo({ top: screen === "feed" ? state.feedScroll : 0 });
+}
+const back = () => go("feed");
+
+// ---------- Стрічка ----------
+function renderExplanationBox(trend) {
+  const explanation = explanationOf(trend);
+  const mode = state.settings.mode;
+  const context = newsContext(trend);
+
+  if (mode === "headlines" || !state.ai.enabled) {
+    return el("div", { class: "ai-box" },
+      el("div", { class: "ai-label" }, el("span", {}, icon("news", "xs"), "Заголовок новини")),
+      el("p", { class: "ai-text", text: context ?? NO_CONTEXT }));
+  }
+  if (explanation?.status === "ai") {
+    return el("div", { class: "ai-box ai" },
+      el("div", { class: "ai-label" }, el("span", {}, icon("spark", "xs"), "Пояснення Gemini"), el("span", { class: "model-tag", text: shortModel(explanation.model) })),
+      el("p", { class: "ai-text", text: explanation.text }));
+  }
+  if (explanation?.status === "loading") {
+    return el("div", { class: "ai-box ai" },
+      el("div", { class: "ai-label" }, el("span", {}, el("span", { class: "spinner", "aria-hidden": "true" }), "Gemini готує пояснення…")),
+      el("p", { class: "ai-text pending", text: context ?? NO_CONTEXT }));
+  }
+  const label = explanation?.status === "failed" ? `З новин · ${AI_FAILURES[explanation.reason] ?? "помилка Gemini"}` : "З новин";
+  return el("div", { class: "ai-box" },
+    el("div", { class: "ai-label" }, el("span", {}, icon("news", "xs"), label)),
+    el("p", { class: "ai-text", text: context ?? NO_CONTEXT }));
 }
 
 function renderCard(trend, feed) {
-  const explanation = state.explanations.get(explanationKey(trend));
-  const context = newsContext(trend) ?? NO_CONTEXT;
-  let label, labelClass = "source-label", text = context, textClass = "explanation";
-  if (explanation?.status === "ai") {
-    label = `✨ Gemini · ${shortModel(explanation.model)}`; labelClass += " ai"; text = explanation.text;
-  } else if (explanation?.status === "loading") {
-    label = "✨ Gemini готує пояснення…"; textClass += " pending";
-  } else if (explanation?.status === "failed") {
-    label = `📰 З новин · ${AI_FAILURES[explanation.reason] ?? "помилка Gemini"}`;
-  } else {
-    label = "📰 З новин";
-  }
-  const meta = [trend.news[0]?.source, trend.publishedAtMillis ? relativeTime(trend.publishedAtMillis) : null].filter(Boolean).join(" · ");
-  const open = () => openUrl(trend.openUrl);
-
-  return el("article", { class: "card" },
-    el("div", {
-      class: "card-main", role: "link", tabindex: "0", onclick: open,
-      onkeydown: (event) => { if (event.key === "Enter") open(); },
-    },
-      el("div", { class: "card-head" },
-        el("span", { class: "rank", text: String(trend.rank), "aria-hidden": "true" }),
-        el("div", { class: "card-title" },
-          el("h3", { text: trend.title }),
-          trend.approxTraffic && el("p", { class: "traffic", text: `🔥 ${trend.approxTraffic} пошуків` }),
-        ),
-        trend.imageUrl && isSafeUrl(trend.imageUrl)
-          && el("img", { class: "thumb", src: trend.imageUrl, alt: "", loading: "lazy", referrerpolicy: "no-referrer", onerror: (event) => event.target.remove() }),
-      ),
-      el("div", { class: "card-body" },
-        el("p", { class: labelClass, text: label }),
-        el("p", { class: textClass, text }),
-      ),
-    ),
+  const open = () => go("detail", { feed, key: trend.key });
+  const source = trend.news[0]?.source;
+  return el("article", {
+    class: "card tappable", tabindex: "0", "aria-label": `${trend.rank}. ${trend.title}. Відкрити деталі`,
+    onclick: open, onkeydown: (event) => { if (event.key === "Enter" && event.target === event.currentTarget) open(); },
+  },
+    el("div", { class: "card-head" },
+      el("span", { class: `rank${trend.rank === 1 ? " top" : ""}`, text: String(trend.rank), "aria-hidden": "true" }),
+      el("div", { class: "card-title" },
+        el("h2", { text: trend.title }),
+        el("p", { class: "metrics" },
+          el("span", { class: "up" }, icon("trending", "xs"), traffic(trend)),
+          trend.publishedAtMillis && el("span", { text: `· ${relativeTime(trend.publishedAtMillis)}` }))),
+      el("button", {
+        class: "icon-btn", type: "button", "aria-label": `Поділитися: ${trend.title}`,
+        onclick: (event) => { event.stopPropagation(); shareTrend(trend); },
+      }, icon("send"))),
+    renderExplanationBox(trend),
     el("div", { class: "card-foot" },
-      el("span", { class: "meta", text: meta }),
-      el("button", { class: "icon-btn more-btn", type: "button", "aria-label": `Інші дії: ${trend.title}`, onclick: () => openActions(trend, feed) },
-        el("span", { text: "⋮", "aria-hidden": "true" })),
-    ),
-  );
+      source
+        ? el("button", {
+          class: "source", type: "button", "aria-label": `Відкрити новину: ${source}`,
+          onclick: (event) => { event.stopPropagation(); openUrl(trend.openUrl); },
+        }, icon("news", "sm"), el("span", { text: source }))
+        : el("span", { class: "source" }, icon("globe", "sm"), el("span", { text: "Google Trends" })),
+      el("span", { class: "pill-btn", "aria-hidden": "true" }, "Деталі", icon("forward", "xs"))));
 }
-
-function message(emoji, title, text, action) {
-  return el("div", { class: "message" },
-    el("div", { class: "emoji", text: emoji, "aria-hidden": "true" }),
-    el("h2", { text: title }),
-    el("p", { text }),
-    action,
-  );
-}
-const retryButton = (feed) => el("button", { class: "primary-btn", type: "button", text: "Спробувати знову", onclick: () => loadSection(feed) });
 
 function renderSkeleton() {
-  const list = el("div", { class: "list skeleton", "aria-busy": "true", "aria-label": "Завантаження" });
-  for (let i = 0; i < 4; i++) {
-    list.append(el("div", { class: "card" }, el("div", { class: "bone title" }), el("div", { class: "bone short" }), el("div", { class: "bone" }), el("div", { class: "bone mid" })));
-  }
-  return list;
+  return el("div", { class: "feed skeleton", "aria-busy": "true", "aria-label": "Завантаження" },
+    [0, 1, 2].map(() => el("div", { class: "card" },
+      el("div", { class: "bone w60" }), el("div", { class: "bone w30" }), el("div", { class: "bone" }), el("div", { class: "bone w80" }))));
 }
 
-function renderBlocked() {
-  const { kind, userId } = state.blocked;
-  if (kind === "not_allowed") {
-    return message("🔒", "Немає доступу", "Надішліть цей номер власнику бота, щоб він додав вас до списку:", el("code", { text: String(userId) }));
-  }
-  if (kind === "misconfigured") {
-    return message("🛠️", "Сервер не налаштовано", "Власнику: задайте секрет BOT_TOKEN командою «npx wrangler secret put BOT_TOKEN».");
-  }
-  return message("✈️", "Відкрийте в Telegram", "Цей застосунок працює лише всередині Telegram: відкрийте його через кнопку бота.");
+function message(iconName, title, text, ...extra) {
+  return el("div", { class: "message" },
+    el("div", { class: "big-icon" }, icon(iconName)),
+    el("h2", { text: title }),
+    el("p", { text }),
+    ...extra);
 }
 
-function renderContent() {
-  if (state.blocked) return renderBlocked();
+function renderFeed() {
   const feed = state.selected;
   const section = state.sections[feed];
-  if (section.trends.length === 0 && section.status === "loading") return renderSkeleton();
+
+  const controls = el("div", { class: "controls" },
+    el("div", { class: "region-row" },
+      el("div", { class: "chips-scroll", role: "tablist", "aria-label": "Країна" },
+        FEEDS.map((f) => {
+          const [flag, name, , short] = REGIONS[state.sections[f].region];
+          return el("button", {
+            class: "region-chip", type: "button", role: "tab", "aria-selected": String(f === feed),
+            onclick: () => { state.selected = f; haptic(); render(); window.scrollTo({ top: 0 }); },
+          }, el("span", { text: flag, "aria-hidden": "true" }), short ?? name);
+        }),
+        el("button", { class: "round-btn", type: "button", "aria-label": "Обрати іншу країну", onclick: openRegionSheet }, icon("globe", "sm")))),
+    state.ai.enabled && el("div", { class: "mode-bar" },
+      el("div", { class: "segmented", role: "group", "aria-label": "Що показувати під трендом" },
+        el("button", { class: "segment", type: "button", "aria-pressed": String(state.settings.mode === "ai"), onclick: () => setMode("ai") }, icon("spark", "sm"), "Пояснення"),
+        el("button", { class: "segment", type: "button", "aria-pressed": String(state.settings.mode === "headlines"), onclick: () => setMode("headlines") }, icon("news", "sm"), "Заголовки")),
+      el("span", { class: "model-status" }, el("span", { class: "dot", "aria-hidden": "true" }), `${shortModel(state.ai.model)} · кеш`)));
+
+  if (section.trends.length === 0 && section.status === "loading") return [controls, renderSkeleton()];
   if (section.trends.length === 0 && section.status === "failed") {
-    return message("☁️", "Не вдалося завантажити тренди", LOAD_ERRORS[section.error] ?? LOAD_ERRORS.http, retryButton(feed));
+    return [controls, message("offline", "Не вдалося завантажити тренди", LOAD_ERRORS[section.error] ?? LOAD_ERRORS.http,
+      el("button", { class: "cta", type: "button", onclick: () => loadSection(feed) }, "Спробувати знову"))];
   }
-  const fragment = document.createDocumentFragment();
-  if (section.status === "failed") {
-    fragment.append(el("div", { class: "banner", role: "status" },
+  return [
+    controls,
+    section.status === "failed" && el("div", { class: "banner", role: "status" },
       el("span", { text: "Не вдалося оновити — показано попередні дані." }),
-      el("button", { class: "text-btn", type: "button", text: "Повторити", onclick: () => loadSection(feed) })));
-  }
-  const visible = visibleTrends(section);
-  if (section.trends.length === 0) {
-    fragment.append(message("📭", "Трендів немає", "Google Trends зараз не повертає трендів для цієї країни."));
-  } else if (visible.length === 0) {
-    fragment.append(message("🔎", "Нічого не знайдено", `Немає трендів зі словом «${state.query.trim()}».`));
-  } else {
-    fragment.append(el("div", { class: "list" }, ...visible.map((trend) => renderCard(trend, feed))));
-  }
-  fragment.append(el("p", { class: "footer-note", text: "Дані: публічний RSS Google Trends (неофіційне джерело)" }));
-  return fragment;
+      el("button", { type: "button", onclick: () => loadSection(feed) }, "Повторити")),
+    section.trends.length === 0
+      ? message("inbox", "Трендів немає", "Google Trends зараз не повертає трендів для цієї країни.")
+      : el("div", { class: "feed" }, section.trends.map((trend) => renderCard(trend, feed))),
+    el("p", { class: "feed-footer" }, el("span", { class: "live-dot", "aria-hidden": "true" }), "Дані: публічний RSS Google Trends · кеш 5 хв"),
+  ];
 }
 
-function render() {
-  const section = state.sections[state.selected];
-  $("subtitle").textContent = state.blocked ? "" : section.updatedAt ? `Оновлено о ${clock(section.updatedAt)}` : section.status === "loading" ? "Завантаження…" : "";
-  // Без доступу показуємо лише повідомлення: вкладки й кнопки нічого б не робили.
-  $("tabs").hidden = Boolean(state.blocked);
-  for (const id of ["btn-ai", "btn-search", "btn-refresh", "btn-settings"]) $(id).hidden = Boolean(state.blocked);
-  if (state.blocked) $("search-row").hidden = true;
-  $("btn-ai").classList.toggle("on", state.ai.enabled);
-  $("btn-refresh").classList.toggle("spinning", state.refreshing);
+function setMode(mode) {
+  if (state.settings.mode === mode) return;
+  state.settings.mode = mode;
+  saveSettings();
+  haptic();
+  render();
+}
 
-  const tabs = FEEDS.map((feed) => el("button", {
-    class: "tab", type: "button", role: "tab", "aria-selected": String(state.selected === feed),
-    text: regionLabel(state.sections[feed].region),
-    onclick: () => { state.selected = feed; render(); window.scrollTo({ top: 0 }); },
-  }));
-  $("tabs").replaceChildren(...tabs);
-  $("content").replaceChildren(renderContent());
+// ---------- Деталі ----------
+function renderDetail() {
+  const { feed, key } = state.detail;
+  const section = state.sections[feed];
+  const trend = section.trends.find((t) => t.key === key);
+  if (!trend) {
+    return message("inbox", "Тренд більше не в списку", "Список оновився, і цього запиту в ньому вже немає.",
+      el("button", { class: "cta", type: "button", onclick: back }, "До трендів"));
+  }
+  const explanation = explanationOf(trend);
+  const context = newsContext(trend);
+  const [flag] = REGIONS[trend.region];
+
+  let why;
+  if (!state.ai.enabled) {
+    why = el("div", { class: "section" },
+      el("h3", {}, icon("news", "sm"), "З новин"),
+      el("p", { text: context ?? NO_CONTEXT }),
+      el("p", { class: "note", text: "На сервері не задано ключ Gemini, тому показано заголовок новини." }));
+  } else if (explanation?.status === "ai") {
+    why = el("div", { class: "section" }, el("h3", {}, icon("spark", "sm"), "Чому це в тренді?"), el("p", { text: explanation.text }));
+  } else if (explanation?.status === "loading") {
+    why = el("div", { class: "section" }, el("h3", {}, el("span", { class: "spinner", "aria-hidden": "true" }), "Gemini готує пояснення…"), el("p", { class: "pending", text: context ?? NO_CONTEXT }));
+  } else {
+    why = el("div", { class: "section" },
+      el("h3", {}, icon("news", "sm"), "З новин"),
+      el("p", { text: context ?? NO_CONTEXT }),
+      explanation?.status === "failed" && el("p", { class: "note", text: `Gemini не відповів: ${AI_FAILURES[explanation.reason] ?? "помилка"}. Спробуйте «Пояснити ще раз».` }));
+  }
+
+  const aiText = explanation?.status === "ai" ? explanation.text : null;
+  const module = el("section", { class: "module", "aria-label": "Пояснення" },
+    el("div", { class: "module-head" },
+      el("div", { class: "tile", "aria-hidden": "true" }, icon("spark", "sm")),
+      el("div", {},
+        el("h2", { text: "Аналіз Gemini AI" }),
+        el("p", { text: aiText ? `Модель: ${explanation.model}` : state.ai.enabled ? `Модель: ${state.ai.model}` : "Gemini вимкнено" }))),
+    why,
+    trend.news.length > 1 && el("div", { class: "section" },
+      el("h3", {}, icon("news", "sm"), "Ключовий контекст"),
+      el("p", { text: trend.news.slice(1).map((n) => n.title).join(" · ") })),
+    el("div", { class: "module-foot" },
+      el("span", { text: aiText ? "Згенеровано за заголовками новин" : "Джерело: Google Trends RSS" }),
+      aiText && el("button", { class: "link-btn", type: "button", onclick: () => copyText(aiText, "Пояснення скопійовано") }, icon("copy", "sm"), "Скопіювати")));
+
+  const news = trend.news.length > 0
+    ? [
+      el("div", { class: "list-title" },
+        el("h2", {}, icon("news", "sm"), "Першоджерела"),
+        el("span", { text: `${trend.news.length} ${trend.news.length === 1 ? "матеріал" : "матеріали"}` })),
+      trend.news.map((article) => {
+        const name = article.source || "Новина";
+        const body = [
+          el("div", { class: "article-head" },
+            el("span", { class: "avatar", text: name.slice(0, 1).toUpperCase(), "aria-hidden": "true" }),
+            el("span", { class: "name", text: name }),
+            article.url && icon("external", "sm")),
+          el("p", { text: article.title || article.snippet }),
+        ];
+        return article.url
+          ? el("a", { class: "article", href: article.url, onclick: (event) => { event.preventDefault(); openUrl(article.url); } }, body)
+          : el("div", { class: "article" }, body);
+      }),
+    ]
+    : [];
+
+  return [
+    el("div", { class: "detail-top" },
+      el("button", { class: "back-pill", type: "button", onclick: back }, icon("back", "sm"), "Назад до трендів")),
+    el("div", { class: "badges" },
+      el("span", { class: "badge rank-badge", text: `#${trend.rank} ${REGIONS[trend.region][2]} ${flag}` }),
+      el("span", { class: "badge traffic" }, icon("trending", "xs"), traffic(trend)),
+      trend.publishedAtMillis && el("span", { class: "badge" }, icon("schedule", "xs"), `почався ${relativeTime(trend.publishedAtMillis)}`)),
+    el("div", { class: "detail-hero" },
+      el("h1", { text: trend.title }),
+      trend.imageUrl && isSafeUrl(trend.imageUrl) && el("img", { src: trend.imageUrl, alt: "", loading: "lazy", referrerpolicy: "no-referrer", onerror: (event) => event.target.remove() })),
+    module,
+    ...news,
+    el("div", { class: "actions" },
+      el("button", { class: "cta", type: "button", onclick: () => shareTrend(trend) }, icon("send", "sm"), "Поділитися"),
+      state.ai.enabled && el("button", {
+        class: "square-btn", type: "button", "aria-label": aiText ? "Пояснити ще раз" : "Пояснити з Gemini",
+        disabled: explanation?.status === "loading", onclick: () => explain(feed, trend),
+      }, icon("regenerate"))),
+    el("button", { class: "secondary-btn", type: "button", onclick: () => openUrl(trend.searchUrl) }, icon("search", "sm"), "Шукати в Google"),
+  ];
+}
+
+// ---------- Налаштування ----------
+function renderSettings() {
+  const user = tg?.initDataUnsafe?.user;
+  const ua = state.sections.ukraine;
+  const profile = el("section", { class: "panel" },
+    el("div", { class: "panel-head" },
+      el("div", {},
+        el("p", { class: "kicker", text: "Профіль Telegram" }),
+        el("div", { class: "id-row" },
+          el("span", { class: "mono", text: user ? `ID: ${user.id}` : "ID недоступний" }),
+          user && el("button", { class: "small-btn", type: "button", "aria-label": "Скопіювати ID", onclick: () => copyText(String(user.id), `ID ${user.id} скопійовано`) }, icon("copy", "sm")))),
+      el("span", { class: "tag ok" }, icon("check", "xs"), "Доступ є")),
+    el("p", { class: "note-text", text: "Доступ надається за запрошенням: власник бота додає ваш ID до списку." }));
+
+  const prefs = el("section", { class: "panel" },
+    el("div", { class: "panel-head" }, el("h2", {}, icon("settings", "sm"), "Стрічка")),
+    el("button", { class: "row", type: "button", onclick: openRegionSheet },
+      el("span", { class: "row-text" }, el("strong", { text: "Третя вкладка" }), el("small", { text: "Країна поруч з Україною та США" })),
+      el("span", { class: "row-value" }, `${REGIONS[state.settings.exploreRegion][0]} ${REGIONS[state.settings.exploreRegion][1]}`, icon("forward", "xs"))),
+    el("div", { class: "row" },
+      el("span", { class: "row-text" }, el("strong", { text: "Мова пояснень" }), el("small", { text: "Якою мовою пише Gemini" })),
+      el("span", { class: "mini-seg", role: "group", "aria-label": "Мова пояснень" },
+        Object.entries(LANGUAGES).map(([code, label]) => el("button", {
+          type: "button", "aria-pressed": String(state.settings.language === code), onclick: () => setLanguage(code),
+        }, code === "uk" ? "UA" : "EN", el("span", { class: "sr-only", text: label }))))),
+    el("label", { class: "row" },
+      el("span", { class: "row-text" },
+        el("strong", { text: "Пояснювати автоматично" }),
+        el("small", { text: state.ai.enabled ? "Gemini пише 1–2 речення до кожного тренду" : "На сервері не задано ключ Gemini" })),
+      el("span", { class: "switch" },
+        el("input", { type: "checkbox", role: "switch", checked: state.settings.autoExplain && state.ai.enabled, disabled: !state.ai.enabled, onchange: (event) => setAutoExplain(event.target.checked) }),
+        el("span", { "aria-hidden": "true" }))));
+
+  const ai = el("section", { class: "panel" },
+    el("div", { class: "panel-head" },
+      el("h2", {}, icon("brain", "sm"), "Конфігурація ШІ"),
+      el("span", { class: state.ai.enabled ? "tag" : "tag warn", text: state.ai.enabled ? "Gemini API" : "Вимкнено" })),
+    el("div", { class: "box" },
+      el("div", { class: "kv" }, el("span", { text: "Основна модель" }), state.ai.enabled ? el("span", { class: "tag ok", text: "активна" }) : el("span", { class: "tag warn", text: "немає ключа" })),
+      el("p", { class: "mono model-name", text: state.ai.model || "—" })),
+    state.ai.fallbacks.length > 0 && el("div", { class: "box" },
+      el("div", { class: "kv" }, el("span", { text: "Резервні моделі (якщо основна перевантажена)" })),
+      el("div", { class: "model-chips" }, state.ai.fallbacks.map((m) => el("span", { class: "model-chip" }, icon("route", "xs"), m)))),
+    el("div", { class: "box" },
+      el("div", { class: "kv" }, el("span", {}, icon("cloud", "sm"), "Сервер"), el("b", { text: state.serverOnline === false ? "недоступний" : state.serverOnline ? "онлайн" : "—" })),
+      el("div", { class: "kv" }, el("span", {}, icon("cached", "sm"), "Тренди оновлено"), el("b", { text: ua.updatedAt ? `${relativeTime(ua.updatedAt)} (кеш 5 хв)` : "—" }))));
+
+  const tools = el("section", { "aria-label": "Діагностика" },
+    el("p", { class: "kicker tools-title", text: "Діагностика" }),
+    el("button", { class: "tool", type: "button", onclick: checkConnection },
+      icon("ping"),
+      el("span", { class: "row-text" }, el("strong", { text: "Перевірити з'єднання" }), el("small", { text: "Запит до сервера й Google Trends" })),
+      icon("forward", "sm")),
+    el("button", { class: "tool", type: "button", onclick: openAiLog },
+      icon("terminal"),
+      el("span", { class: "row-text" }, el("strong", { text: "Остання відповідь Gemini" }), el("small", { text: state.lastAiError ? "Є помилка — натисніть, щоб побачити" : "Помилок не було" })),
+      icon("forward", "sm")),
+    el("p", { class: "note-text", text: "Google Trends RSS публікує лише поточні тренди (приблизно за добу) для всієї країни. Періоду, категорій і демографії в цьому джерелі немає." }));
+
+  return [profile, prefs, ai, tools];
+}
+
+function setLanguage(code) {
+  if (state.settings.language === code) return;
+  state.settings.language = code;
+  saveSettings();
+  haptic();
+  render();
+  if (state.settings.autoExplain) for (const feed of FEEDS) if (state.sections[feed].status === "loaded") explain(feed);
+}
+function setAutoExplain(on) {
+  state.settings.autoExplain = on;
+  saveSettings();
+  haptic();
+  render();
+  if (on) for (const feed of FEEDS) if (state.sections[feed].status === "loaded") explain(feed);
+}
+async function checkConnection() {
+  const started = performance.now();
+  try {
+    await api(`/api/trends?geo=UA&limit=1`);
+    toast(`Сервер відповів за ${Math.round(performance.now() - started)} мс`);
+  } catch (error) {
+    if (handleAuthError(error)) return;
+    toast(error.status === 0 ? "Немає з'єднання із сервером" : "Google Trends не відповідає", "close");
+  }
+  render();
 }
 
 // ---------- Панелі ----------
 function showSheet(dialog) {
   dialog.showModal();
-  tg?.HapticFeedback?.impactOccurred?.("light");
+  haptic();
 }
 for (const dialog of document.querySelectorAll("dialog")) {
-  // Клік по затемненню закриває панель.
   dialog.addEventListener("click", (event) => { if (event.target === dialog) dialog.close(); });
   dialog.querySelector("[data-close]")?.addEventListener("click", () => dialog.close());
 }
-
-let actionTarget = null;
-function openActions(trend, feed) {
-  actionTarget = { trend, feed };
-  const explanation = state.explanations.get(explanationKey(trend));
-  $("actions-title").textContent = trend.title;
-  const explainButton = $("action-explain");
-  explainButton.hidden = !state.ai.enabled;
-  explainButton.disabled = explanation?.status === "loading";
-  explainButton.textContent = explanation?.status === "ai" ? "Пояснити ще раз" : "Пояснити з Gemini";
-  showSheet($("sheet-actions"));
+function openRegionSheet() {
+  $("region-options").replaceChildren(...EXPLORE_CHOICES.map((code) => el("button", {
+    class: "region-chip", type: "button", role: "radio", "aria-checked": String(state.settings.exploreRegion === code),
+    "aria-selected": String(state.settings.exploreRegion === code),
+    onclick: () => { $("sheet-region").close(); setExploreRegion(code); },
+  }, el("span", { text: REGIONS[code][0], "aria-hidden": "true" }), REGIONS[code][1])));
+  showSheet($("sheet-region"));
 }
-$("sheet-actions").addEventListener("click", (event) => {
-  const action = event.target.closest("[data-action]")?.dataset.action;
-  if (!action || !actionTarget) return;
-  const { trend, feed } = actionTarget;
-  $("sheet-actions").close();
-  if (action === "search") openUrl(trend.searchUrl);
-  else if (action === "share") shareTrend(trend);
-  else if (action === "explain") explain(feed, trend);
-});
-
-function chipGroup(container, options, selected, onSelect) {
-  container.replaceChildren(...options.map(([value, label]) => el("button", {
-    class: "chip", type: "button", role: "radio", "aria-checked": String(value === selected), text: label,
-    onclick: () => { onSelect(value); chipGroup(container, options, value, onSelect); },
-  })));
-}
-let draft = null;
-$("btn-settings").addEventListener("click", () => {
-  draft = { ...state.settings };
-  chipGroup($("region-chips"), EXPLORE_CHOICES.map((code) => [code, regionLabel(code)]), draft.exploreRegion, (v) => { draft.exploreRegion = v; });
-  chipGroup($("lang-chips"), Object.entries(LANGUAGES), draft.language, (v) => { draft.language = v; });
-  const auto = $("auto-explain");
-  auto.checked = draft.autoExplain && state.ai.enabled;
-  auto.disabled = !state.ai.enabled;
-  $("auto-hint").textContent = state.ai.enabled ? "Gemini пише 1–2 речення до кожного тренду" : "На сервері не задано ключ Gemini";
-  showSheet($("sheet-settings"));
-});
-$("settings-apply").addEventListener("click", () => {
-  const old = state.settings;
-  const next = { ...draft, autoExplain: state.ai.enabled ? $("auto-explain").checked : old.autoExplain };
-  state.settings = next;
-  saveSettings();
-  $("sheet-settings").close();
-
-  if (next.exploreRegion !== old.exploreRegion) {
-    state.sections.explore = newSection(next.exploreRegion);
-    state.selected = "explore";
+function setExploreRegion(code) {
+  if (state.settings.exploreRegion !== code) {
+    state.settings.exploreRegion = code;
+    saveSettings();
+    state.sections.explore = newSection(code);
     loadSection("explore");
   }
-  // Нова мова або щойно ввімкнене авто-пояснення: пояснюємо вже завантажені вкладки.
-  if (next.autoExplain && (next.language !== old.language || !old.autoExplain)) {
-    for (const feed of FEEDS) if (state.sections[feed].status === "loaded") explain(feed);
+  state.selected = "explore";
+  if (state.screen !== "settings") go("feed");
+  else render();
+}
+function openAiLog() {
+  $("ai-log").textContent = state.lastAiError ?? "Помилок не було: остання відповідь Gemini успішна або запитів ще не було.";
+  showSheet($("sheet-ai-log"));
+}
+
+// ---------- Рендер ----------
+function renderBlocked() {
+  const { kind, userId } = state.blocked;
+  if (kind === "not_allowed") {
+    return message("lock", "Немає доступу", "Надішліть цей номер власнику бота, щоб він додав вас до списку:",
+      el("p", {}, el("span", { class: "mono", text: String(userId) })),
+      el("button", { class: "cta", type: "button", onclick: () => copyText(String(userId), "Номер скопійовано") }, icon("copy", "sm"), "Скопіювати"));
   }
-  render();
-});
+  if (kind === "misconfigured") {
+    return message("settings", "Сервер не налаштовано", "Власнику: задайте секрет BOT_TOKEN у Cloudflare (Settings → Variables and Secrets).");
+  }
+  return message("send", "Відкрийте в Telegram", "Цей застосунок працює лише всередині Telegram: відкрийте його через кнопку бота.");
+}
 
-$("btn-ai").addEventListener("click", () => {
-  $("ai-status").textContent = state.ai.enabled ? `✅ Gemini підключено · модель ${state.ai.model}` : "🔑 На сервері не задано ключ Gemini — показуються лише заголовки новин";
-  $("ai-error-box").hidden = !state.lastAiError;
-  $("ai-error").textContent = state.lastAiError ?? "";
-  showSheet($("sheet-ai"));
-});
+function renderNav() {
+  const items = [["feed", "fire", "Тренди"], ["settings", "settings", "Налаштування"]];
+  $("nav").replaceChildren(...items.map(([screen, iconName, label]) => el("button", {
+    class: "nav-item", type: "button", "aria-current": state.screen === screen ? "page" : null,
+    onclick: () => { if (state.screen !== screen) go(screen); else window.scrollTo({ top: 0, behavior: "smooth" }); },
+  }, icon(iconName), label)));
+}
 
-$("btn-search").addEventListener("click", () => {
-  const row = $("search-row");
-  row.hidden = !row.hidden;
-  $("btn-search").setAttribute("aria-expanded", String(!row.hidden));
-  if (row.hidden) { state.query = ""; $("search").value = ""; render(); } else $("search").focus();
-});
-$("search").addEventListener("input", (event) => { state.query = event.target.value; render(); });
-$("btn-refresh").addEventListener("click", refreshAll);
+function render() {
+  const blocked = Boolean(state.blocked);
+  const screen = blocked ? "blocked" : state.screen;
+  const section = state.sections[state.selected];
+
+  $("screen-title").textContent = screen === "detail" ? "Деталі тренду" : screen === "settings" ? "Налаштування" : "Trends Pulse";
+  const sub = blocked ? "" : screen === "settings" ? "Доступ і конфігурація"
+    : screen === "detail" ? REGIONS[state.sections[state.detail.feed].region].slice(0, 2).join(" ")
+      : section.updatedAt ? `Оновлено о ${clock(section.updatedAt)}` : "Завантаження…";
+  $("screen-sub").textContent = sub;
+  $("status-dot").className = `live-dot${screen === "feed" ? " pulse" : ""}`;
+  $("status-dot").hidden = !sub;
+  const sync = $("sync");
+  sync.hidden = screen !== "feed";
+  sync.classList.toggle("spinning", state.refreshing);
+  sync.lastElementChild.textContent = state.refreshing ? "Оновлення…" : section.updatedAt ? relativeTime(section.updatedAt) : "Оновити";
+
+  const showNav = !blocked && screen !== "detail";
+  $("nav").hidden = !showNav;
+  document.body.classList.toggle("no-nav", !showNav);
+  if (showNav) renderNav();
+
+  if (tg?.BackButton) {
+    if (screen === "detail") tg.BackButton.show();
+    else tg.BackButton.hide();
+  }
+
+  const content = screen === "blocked" ? renderBlocked() : screen === "detail" ? renderDetail() : screen === "settings" ? renderSettings() : renderFeed();
+  $("content").replaceChildren(...[content].flat(Infinity).filter(Boolean));
+}
 
 // ---------- Запуск ----------
 function applyTheme() {
-  const scheme = tg?.initData ? tg.colorScheme : null;
-  document.documentElement.classList.toggle("dark", scheme === "dark");
-  document.documentElement.classList.toggle("light", scheme === "light");
+  const dark = inTelegram ? tg.colorScheme !== "light" : !window.matchMedia("(prefers-color-scheme: light)").matches;
+  document.documentElement.classList.toggle("light", !dark);
+  const bg = getComputedStyle(document.documentElement).getPropertyValue("--bg").trim();
+  try { tg?.setHeaderColor?.(bg); tg?.setBackgroundColor?.(bg); tg?.setBottomBarColor?.(bg); } catch { /* старий клієнт Telegram */ }
 }
+$("sync").prepend(icon("sync", "xs"));
+$("sync").addEventListener("click", refreshAll);
 tg?.ready?.();
 tg?.expand?.();
 tg?.onEvent?.("themeChanged", applyTheme);
+tg?.BackButton?.onClick?.(back);
+window.matchMedia("(prefers-color-scheme: light)").addEventListener?.("change", () => { if (!inTelegram) applyTheme(); });
+document.addEventListener("keydown", (event) => { if (event.key === "Escape" && state.screen === "detail" && !document.querySelector("dialog[open]")) back(); });
 applyTheme();
 render();
 for (const feed of FEEDS) loadSection(feed);
