@@ -57,7 +57,11 @@ export async function handleApi(request: Request, env: Env, svc: TrendsService =
         region: geo,
         updatedAtMillis: snapshot.fetchedAtMillis,
         trends: snapshot.trends.slice(0, parseLimit(url.searchParams.get("limit"))),
-        ai: { enabled: svc.aiEnabled, model: sanitizeModel(env.GEMINI_MODEL) },
+        ai: {
+          enabled: svc.aiEnabled,
+          model: sanitizeModel(env.GEMINI_MODEL),
+          fallbacks: DEFAULT_FALLBACK_MODELS.filter((m) => m !== sanitizeModel(env.GEMINI_MODEL)),
+        },
       });
     } catch (e) {
       if (e instanceof TrendsLoadError) return json({ error: "load_failed", reason: e.error }, 502);

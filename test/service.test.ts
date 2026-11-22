@@ -176,7 +176,7 @@ describe("API", () => {
     const res = await handleApi(new Request("https://x/api/trends?geo=GB&limit=10"), env, svc);
     const data = (await res.json()) as any;
     expect(data.trends).toHaveLength(10);
-    expect(data.ai).toEqual({ enabled: true, model: "gemini-3.8-flash" });
+    expect(data.ai).toEqual({ enabled: true, model: "gemini-3.8-flash", fallbacks: ["gemini-3.6-flash", "gemini-3.5-flash-lite"] });
     expect(((await (await handleApi(new Request("https://x/api/trends?geo=UA&limit=99"), env, svc)).json()) as any).trends).toHaveLength(5);
     expect((await handleApi(new Request("https://x/api/trends?geo=XX"), env, svc)).status).toBe(400);
     expect((await handleApi(post({ geo: "UA", lang: "de" }), env, svc)).status).toBe(400);
